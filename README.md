@@ -129,6 +129,11 @@ Included profiles:
   Z.ai" browser login can complete on the virtual desktop (`--build-arg
   WITH_BROWSER=0` to skip it and use an API key). Pin a version with
   `dwork build zcode --build-arg ZCODE_VERSION=x.y.z`.
+- `chatgpt` – official ChatGPT desktop app (ChatGPT, Work, and Codex) from
+  OpenAI's `latest/` Linux `.deb`. Same Electron flags and optional Firefox
+  for account sign-in. Force a fresh download with
+  `dwork build chatgpt --build-arg CHATGPT_REFRESH=$(date +%s)`.
+  Codex agent jobs that use bubblewrap may need extra Docker privileges.
 
 To add another X11 app: create `profiles/foo/Dockerfile` that `apt`s or unpacks
 it, set `DWORK_KIND=x11` and `DWORK_APP_CMD` in `profile.env`, done. Electron

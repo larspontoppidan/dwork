@@ -1,0 +1,41 @@
+#!/bin/bash
+# Post-install: ChatGPT's .desktop file claims http/https, so xdg-open
+# relaunches ChatGPT for the OAuth URL and that child dies (SIGTRAP) without
+# Electron flags. Send web URLs to Firefox and wrap the binary so every
+# exec — including protocol-handler relaunches — gets the flags.
+set -eu
+
+APPDIR=/usr/lib/chatgpt
+BIN="$APPDIR/ChatGPT"
+REAL="$APPDIR/ChatGPT.bin"
+DESKTOP=/usr/share/applications/chatgpt.desktop
+
+if [ -x "$BIN" ] && [ ! -e "$REAL" ]; then
+  mv "$BIN" "$REAL"
+fi
+
+cat > "$BIN" <<'EOF'
+#!/bin/sh
+export ELECTRON_DISABLE_SANDBOX=1
+export ELECTRON_OZONE_PLATFORM=x11
+exec "$(dirname "$(readlink -f "$0")")/ChatGPT.bin" \
+  --no-sandbox --disable-gpu --disable-dev-shm-usage --ozone-platform=x11 \
+  "$@"
+EOF
+chmod 0755 "$BIN"
+
+if [ -f "$DESKTOP" ]; then
+  sed -i -e 's|x-scheme-handler/http;||g' -e 's|x-scheme-handler/https;||g' "$DESKTOP"
+fi
+
+install -d /etc/xdg
+cat > /etc/xdg/mimeapps.list <<'EOF'
+[Default Applications]
+x-scheme-handler/http=firefox-esr.desktop
+x-scheme-handler/https=firefox-esr.desktop
+text/html=firefox-esr.desktop
+EOF
+
+if command -v update-desktop-database >/dev/null 2>&1; then
+  update-desktop-database /usr/share/applications || true
+fi
