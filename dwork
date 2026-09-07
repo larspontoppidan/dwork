@@ -4,8 +4,8 @@
 #
 # Every instance is a docker compose project generated into
 #   $DWORK_HOME/instances/NAME/   (compose.yaml, .env, secrets.env)
-# and reachable through a shared nginx proxy (TLS + basic auth) at
-#   https://NAME.localhost:4443
+# Web instances are reachable through a shared nginx proxy (TLS + basic auth)
+# at https://NAME.localhost:4443. X11 instances publish VNC on 127.0.0.1.
 #
 set -euo pipefail
 
@@ -39,6 +39,8 @@ Instances
   create NAME --profile P [options]   create, build and start an instance
       --mount HOST[:CONTAINER]        bind mount (repeatable; default /work/<basename>)
       --port HOSTPORT                 also publish the app port on 127.0.0.1:HOSTPORT
+      --vnc-port HOSTPORT             publish VNC on 127.0.0.1:HOSTPORT (x11; default 5901)
+      --no-vnc                        do not publish the VNC port
       --no-proxy                      do not add the instance to the HTTPS proxy
       --user NAME                     login name for the proxy (default: \$USER)
       --geometry WxH                  virtual desktop size (x11 profiles, default $DEFAULT_GEOMETRY)
@@ -47,7 +49,7 @@ Instances
   start|stop|restart NAME             lifecycle of the whole container
   bash NAME [CMD...]                  interactive shell (or run CMD) inside the container
   app NAME start|stop|restart|status  control the supervised application
-  logs NAME [PROGRAM]                 follow logs (default: app; x11: xvnc, openbox, novnc)
+  logs NAME [PROGRAM]                 follow logs (default: app; x11: xvnc, openbox)
   url NAME                            print access URLs and the ssh tunnel command
   status                              list instances
   rm NAME [--purge]                   remove instance (--purge also deletes the home volume)
@@ -109,6 +111,7 @@ load_instance() {
   local dir; dir="$(instance_dir "$1")"
   DW_NAME="$1"
   DW_PROFILE="" DW_KIND="" DW_HTTP_PORT="" DW_HOST_PORT="" DW_PROXY="" DW_USER=""
+  DW_VNC_PORT="" DW_VNC_HOST_PORT=""
   eval "$(sed -n 's/^DWORK_\([A-Z_]*=\)/DW_\1/p' "$dir/.env")"
 }
 
@@ -154,7 +157,7 @@ load_profile() {
   P_AUTH_USER_ENV="" P_AUTH_PASS_ENV=""
   eval "$(sed -n 's/^DWORK_\([A-Z_]*=\)/P_\1/p' "$file")"
   case "$P_KIND" in
-    x11)   P_BASE="${P_BASE:-x11}"; P_HTTP_PORT="${P_HTTP_PORT:-6080}" ;;
+    x11)   P_BASE="${P_BASE:-x11}" ;;
     web)   P_BASE="${P_BASE:-base}"; [ -n "$P_HTTP_PORT" ] || die "profile $profile: DWORK_HTTP_PORT missing" ;;
     shell) P_BASE="${P_BASE:-base}" ;;
     *)     die "profile $profile: DWORK_KIND must be x11, web or shell" ;;
@@ -263,6 +266,7 @@ write_htpasswd() {
 cmd_create() {
   local name="" profile="" host_port="" proxy=1 user="${USER:-$(id -un)}"
   local geometry="$DEFAULT_GEOMETRY" app_cmd="" start=1
+  local vnc_host_port="5901" publish_vnc=1
   local mounts=()
 
   while [ $# -gt 0 ]; do
@@ -270,6 +274,8 @@ cmd_create() {
       --profile|-p) profile="$2"; shift ;;
       --mount|-m)   mounts+=("$2"); shift ;;
       --port)       host_port="$2"; shift ;;
+      --vnc-port)   vnc_host_port="$2"; publish_vnc=1; shift ;;
+      --no-vnc)     publish_vnc=0; vnc_host_port="" ;;
       --no-proxy)   proxy=0 ;;
       --user)       user="$2"; shift ;;
       --geometry)   geometry="$2"; shift ;;
@@ -286,6 +292,7 @@ cmd_create() {
   [ -n "$profile" ] || die "create: --profile is required (see 'dwork profiles')"
   valid_name "$name" || die "name must be lowercase letters, digits and hyphens"
   [ -z "$host_port" ] || valid_port "$host_port" || die "invalid --port"
+  [ -z "$vnc_host_port" ] || valid_port "$vnc_host_port" || die "invalid --vnc-port"
   [[ "$geometry" =~ ^[0-9]+x[0-9]+$ ]] || die "invalid --geometry, expected WxH"
   [[ "$user" =~ ^[A-Za-z0-9._@-]+$ ]] || die "invalid --user"
   require_docker
@@ -295,7 +302,12 @@ cmd_create() {
   local dir; dir="$(instance_dir "$name")"
   ! instance_exists "$name" || die "instance $name already exists"
   ! docker container inspect "$name" >/dev/null 2>&1 || die "a container named $name already exists"
-  [ "$P_KIND" != shell ] || { proxy=0; host_port=""; }
+  case "$P_KIND" in
+    shell) proxy=0; host_port=""; publish_vnc=0; vnc_host_port="" ;;
+    x11)   proxy=0; host_port="" ;;
+    web)   publish_vnc=0; vnc_host_port="" ;;
+  esac
+  [ "$publish_vnc" = 1 ] || vnc_host_port=""
   [ -n "$app_cmd" ] || app_cmd="$P_APP_CMD"
 
   # Resolve mounts: HOST[:CONTAINER]
@@ -347,6 +359,8 @@ cmd_create() {
     env_line DWORK_APP_CMD "$app_cmd"
     env_line DWORK_APP_AUTOSTART "$([ -n "$app_cmd" ] && echo true || echo false)"
     env_line DWORK_GEOMETRY "$geometry"
+    env_line DWORK_VNC_PORT "5901"
+    env_line DWORK_VNC_HOST_PORT "${vnc_host_port:-}"
   } > "$dir/.env"
 
   {
@@ -383,12 +397,18 @@ write_compose() {
 
   load_instance "$(basename "$dir")"
 
-  if [ -n "$DW_HOST_PORT" ]; then
-    ports="    ports:"$'\n'"      - \"127.0.0.1:\${DWORK_HOST_PORT}:\${DWORK_HTTP_PORT}\""$'\n'
-  fi
   if [ "$DW_KIND" = x11 ]; then
     shm="    shm_size: 1g"$'\n'
     x11env="      DWORK_GEOMETRY: \${DWORK_GEOMETRY}"$'\n'
+  fi
+  if [ -n "$DW_VNC_HOST_PORT" ] || [ -n "$DW_HOST_PORT" ]; then
+    ports="    ports:"$'\n'
+    if [ -n "$DW_VNC_HOST_PORT" ]; then
+      ports+="      - \"127.0.0.1:\${DWORK_VNC_HOST_PORT}:\${DWORK_VNC_PORT}\""$'\n'
+    fi
+    if [ -n "$DW_HOST_PORT" ]; then
+      ports+="      - \"127.0.0.1:\${DWORK_HOST_PORT}:\${DWORK_HTTP_PORT}\""$'\n'
+    fi
   fi
 
   cat > "$dir/compose.yaml" <<EOF
@@ -511,7 +531,12 @@ cmd_url() {
     echo "Direct:  http://127.0.0.1:${DW_HOST_PORT}  (no TLS, no auth; tunnel it)"
   fi
   if [ "$DW_KIND" = x11 ]; then
-    echo "VNC:     inside the container on localhost:5901; noVNC on :${DW_HTTP_PORT}"
+    if [ -n "$DW_VNC_HOST_PORT" ]; then
+      echo "VNC:     127.0.0.1:${DW_VNC_HOST_PORT}  (no password; localhost only)"
+      echo "Tunnel:  ssh -N -L ${DW_VNC_HOST_PORT}:127.0.0.1:${DW_VNC_HOST_PORT} ${USER:-user}@$(hostname)"
+    else
+      echo "VNC:     not published (create with --vnc-port, or add a ports: mapping)"
+    fi
   fi
 }
 
@@ -527,7 +552,9 @@ cmd_status() {
     load_instance "$name"
     st="$(container_status "$name")"
     local access="dwork bash $name"
-    if [ "$DW_KIND" != shell ]; then
+    if [ "$DW_KIND" = x11 ] && [ -n "$DW_VNC_HOST_PORT" ]; then
+      access="vnc://127.0.0.1:${DW_VNC_HOST_PORT}"
+    elif [ "$DW_KIND" != shell ]; then
       if [ "$DW_PROXY" = 1 ]; then
         access="https://${name}.localhost:${HTTPS_PORT}"
       elif [ -n "$DW_HOST_PORT" ]; then
@@ -655,6 +682,8 @@ proxy_add() {
   local name="$1"
   load_instance "$name"
   [ "$DW_KIND" != shell ] || die "shell instances have nothing to proxy"
+  [ "$DW_KIND" != x11 ] || die "x11 instances have no HTTP service; use VNC (dwork url $name)"
+  [ -n "$DW_HTTP_PORT" ] && [ "$DW_HTTP_PORT" != 0 ] || die "instance $name has no HTTP port to proxy"
   proxy_init
 
   [ -f "$PROXY_DIR/certs/$name.crt" ] || make_cert "$name" "$name"
@@ -662,18 +691,6 @@ proxy_add() {
     echo "Login for https://$name.localhost:$HTTPS_PORT (user: $DW_USER)"
     prompt_password "$DW_USER"; write_htpasswd "$name" "$DW_USER" "$PASSWORD"; unset PASSWORD
   }
-
-  local root_location=""
-  if [ "$DW_KIND" = x11 ]; then
-    # Land on the noVNC client (the redirect itself carries nothing sensitive;
-    # everything it points to is behind auth_basic).
-    root_location="
-    absolute_redirect off;
-    location = / {
-        return 302 /vnc.html?autoconnect=1&resize=remote&reconnect=1&reconnect_delay=1000;
-    }
-"
-  fi
 
   cat > "$PROXY_DIR/conf.d/$name.conf" <<EOF
 # Generated by dwork for instance $name (${DW_KIND}).
@@ -689,7 +706,6 @@ server {
 
     client_max_body_size 0;
     resolver 127.0.0.11 valid=10s ipv6=off;
-${root_location}
     location / {
         set \$upstream http://${name}:${DW_HTTP_PORT};
         proxy_pass \$upstream;
