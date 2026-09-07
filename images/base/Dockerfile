@@ -4,7 +4,7 @@
 # - passwordless sudo, so `apt install` works from an interactive shell
 # - supervisord is PID 1; the application is a supervised program, so the
 #   container (and shell access) survives application crashes and restarts
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 
 ARG UID=1000
 ARG GID=1000

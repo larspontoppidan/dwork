@@ -6,7 +6,7 @@ app** on a virtual desktop exposed through VNC (ZCode, the Z.ai desktop
 app), or nothing at all (a plain **shell** box). Every instance:
 
 - runs as a user with your host UID/GID, so bind-mounted files keep their owner
-- has passwordless `sudo` and a normal Debian toolchain, so you can `apt install`
+- has passwordless `sudo` and a Debian 13 (trixie) toolchain, so you can `apt install`
   and poke around with `dwork bash NAME`
 - keeps its `$HOME` in a named Docker volume and mounts any number of host
   directories under `/work/...`
@@ -78,7 +78,7 @@ Inside a container the same controls exist: `supervisorctl status`,
 ## How it fits together
 
 ```
-images/base    debian + hostuser(UID/GID) + sudo + tools + supervisord (PID 1)
+images/base    Debian 13 + hostuser(UID/GID) + sudo + tools + supervisord (PID 1)
 images/x11     + Xtigervnc (X server & VNC server, display :1, published on the host)
                + openbox + Electron/GTK runtime libs
 profiles/P     Dockerfile (optional) + profile.env describing the app

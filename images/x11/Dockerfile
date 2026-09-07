@@ -18,8 +18,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         openbox xterm x11-utils x11-xserver-utils xdg-utils \
         dbus-x11 at-spi2-core \
         fonts-dejavu fonts-liberation fonts-noto-core \
-        libgtk-3-0 libnss3 libasound2 libxss1 libgbm1 libxshmfence1 libdrm2 \
-        libatk-bridge2.0-0 libcups2 libnotify4 libsecret-1-0 libxkbfile1 libfuse2 \
+        libgtk-3-0t64 libnss3 libasound2t64 libxss1 libgbm1 libxshmfence1 libdrm2 \
+        libatk-bridge2.0-0t64 libcups2t64 libnotify4 libsecret-1-0 libxkbfile1 libfuse2 \
     && apt-get clean && rm -rf /var/lib/apt/lists/* \
     && mkdir -p /tmp/.X11-unix && chmod 1777 /tmp/.X11-unix \
     && mkdir -p /run/dwork/xdg && chown hostuser:hostuser /run/dwork/xdg && chmod 700 /run/dwork/xdg
