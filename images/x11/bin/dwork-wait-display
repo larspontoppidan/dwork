@@ -1,0 +1,15 @@
+#!/bin/bash
+# Wait until the X server on $DISPLAY accepts connections, then exec "$@"
+# (or just return when called without arguments).
+set -u
+
+for _ in $(seq 1 100); do
+  if xdpyinfo -display "${DISPLAY:-:1}" >/dev/null 2>&1; then
+    [ $# -eq 0 ] && exit 0
+    exec "$@"
+  fi
+  sleep 0.2
+done
+
+echo "dwork-wait-display: X server on ${DISPLAY:-:1} did not come up" >&2
+exit 1

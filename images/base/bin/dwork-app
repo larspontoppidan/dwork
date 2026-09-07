@@ -1,0 +1,22 @@
+#!/bin/bash
+# Supervisor wrapper for the application program.
+#
+# Runs $DWORK_APP_CMD through a login shell so profile PATH tweaks apply.
+# In X11 images it also waits for the display and provides a session D-Bus,
+# which Electron/GTK applications expect.
+set -u
+
+if [ -z "${DWORK_APP_CMD:-}" ]; then
+  echo "dwork-app: DWORK_APP_CMD is empty, nothing to run" >&2
+  sleep 5
+  exit 1
+fi
+
+if [ -n "${DISPLAY:-}" ] && command -v dwork-wait-display >/dev/null 2>&1; then
+  dwork-wait-display || exit 1
+  if [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ] && command -v dbus-run-session >/dev/null 2>&1; then
+    exec dbus-run-session -- bash -lc "$DWORK_APP_CMD"
+  fi
+fi
+
+exec bash -lc "$DWORK_APP_CMD"

@@ -1,0 +1,787 @@
+#!/bin/bash
+#
+# dwork - containerized "pet" workspaces for web apps and X11 apps.
+#
+# Every instance is a docker compose project generated into
+#   $DWORK_HOME/instances/NAME/   (compose.yaml, .env, secrets.env)
+# and reachable through a shared nginx proxy (TLS + basic auth) at
+#   https://NAME.localhost:4443
+#
+set -euo pipefail
+
+DWORK_ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+DWORK_HOME="${DWORK_HOME:-${XDG_CONFIG_HOME:-$HOME/.config}/dwork}"
+INSTANCES_DIR="$DWORK_HOME/instances"
+PROXY_DIR="$DWORK_HOME/proxy"
+PROFILES_DIR="$DWORK_ROOT/profiles"
+IMAGES_DIR="$DWORK_ROOT/images"
+
+NETWORK_NAME="dwork-web"
+PROXY_NAME="dwork-proxy"
+PROXY_IMAGE="${DWORK_PROXY_IMAGE:-nginx:stable-bookworm}"
+HTTPS_PORT="${DWORK_HTTPS_PORT:-4443}"
+PROXY_BIND="${DWORK_PROXY_BIND:-127.0.0.1}"
+DEFAULT_GEOMETRY="1920x1080"
+
+# ---------------------------------------------------------------------------
+# helpers
+# ---------------------------------------------------------------------------
+
+die()  { echo "dwork: $*" >&2; exit 1; }
+warn() { echo "dwork: $*" >&2; }
+info() { echo "==> $*"; }
+
+usage() {
+  cat <<EOF
+Usage: dwork <command> [args]
+
+Instances
+  create NAME --profile P [options]   create, build and start an instance
+      --mount HOST[:CONTAINER]        bind mount (repeatable; default /work/<basename>)
+      --port HOSTPORT                 also publish the app port on 127.0.0.1:HOSTPORT
+      --no-proxy                      do not add the instance to the HTTPS proxy
+      --user NAME                     login name for the proxy (default: \$USER)
+      --geometry WxH                  virtual desktop size (x11 profiles, default $DEFAULT_GEOMETRY)
+      --app-cmd CMD                   override the profile's application command
+      --no-start                      generate and build only
+  start|stop|restart NAME             lifecycle of the whole container
+  bash NAME [CMD...]                  interactive shell (or run CMD) inside the container
+  app NAME start|stop|restart|status  control the supervised application
+  logs NAME [PROGRAM]                 follow logs (default: app; x11: xvnc, openbox, novnc)
+  url NAME                            print access URLs and the ssh tunnel command
+  status                              list instances
+  rm NAME [--purge]                   remove instance (--purge also deletes the home volume)
+  edit NAME                           open the instance compose.yaml in \$EDITOR
+
+Images
+  profiles                            list available profiles
+  build PROFILE [--pull] [--build-arg K=V]...   (re)build the images for a profile
+
+Proxy
+  proxy add|rm NAME                   attach/detach an instance to the shared nginx proxy
+  proxy passwd NAME                   change the login for an instance
+  proxy reload|status|logs            manage the proxy container
+
+Environment
+  DWORK_HOME          state directory (default ~/.config/dwork)
+  DWORK_HTTPS_PORT    proxy port (default 4443)
+  DWORK_PROXY_BIND    proxy bind address (default 127.0.0.1)
+  DWORK_DOMAIN        extra domain for certificates, e.g. myserver.lan
+EOF
+}
+
+require_command() {
+  command -v "$1" >/dev/null 2>&1 || die "$1 is required"
+}
+
+require_docker() {
+  require_command docker
+  docker compose version >/dev/null 2>&1 || die "docker compose plugin is required"
+}
+
+valid_name() {
+  [[ "$1" =~ ^[a-z0-9][a-z0-9-]{0,40}$ ]]
+}
+
+valid_port() {
+  [[ "$1" =~ ^[0-9]+$ ]] && (( $1 >= 1 && $1 <= 65535 ))
+}
+
+host_ids() {
+  UID_NUM="${DWORK_UID:-$(id -u)}"
+  GID_NUM="${DWORK_GID:-$(id -g)}"
+  if [ "$UID_NUM" = 0 ]; then
+    die "running as root; run dwork as your normal user or set DWORK_UID/DWORK_GID"
+  fi
+}
+
+instance_dir() { echo "$INSTANCES_DIR/$1"; }
+
+instance_exists() { [ -f "$(instance_dir "$1")/compose.yaml" ]; }
+
+require_instance() {
+  valid_name "$1" || die "invalid instance name: $1"
+  instance_exists "$1" || die "no such instance: $1 (see 'dwork status')"
+}
+
+# Load instance settings (.env) into DW_* variables.
+load_instance() {
+  local dir; dir="$(instance_dir "$1")"
+  DW_NAME="$1"
+  DW_PROFILE="" DW_KIND="" DW_HTTP_PORT="" DW_HOST_PORT="" DW_PROXY="" DW_USER=""
+  eval "$(sed -n 's/^DWORK_\([A-Z_]*=\)/DW_\1/p' "$dir/.env")"
+}
+
+compose() {
+  local name="$1"; shift
+  docker compose --project-directory "$(instance_dir "$name")" "$@"
+}
+
+container_running() {
+  [ "$(docker container inspect -f '{{.State.Running}}' "$1" 2>/dev/null || true)" = "true" ]
+}
+
+container_status() {
+  local st
+  st="$(docker container inspect -f '{{.State.Status}}' "$1" 2>/dev/null)" || st=""
+  echo "${st:-absent}"
+}
+
+# Write KEY='value' lines suitable for both docker compose .env files and bash.
+env_line() {
+  local key="$1" value="$2"
+  case "$value" in
+    *\'*|*$'\n'*) die "value for $key must not contain single quotes or newlines" ;;
+  esac
+  printf "%s='%s'\n" "$key" "$value"
+}
+
+ensure_network() {
+  docker network inspect "$NETWORK_NAME" >/dev/null 2>&1 ||
+    docker network create "$NETWORK_NAME" >/dev/null
+}
+
+# ---------------------------------------------------------------------------
+# profiles
+# ---------------------------------------------------------------------------
+
+# Load profile P into P_* variables.
+load_profile() {
+  local profile="$1" file="$PROFILES_DIR/$1/profile.env"
+  [ -f "$file" ] || die "unknown profile: $profile (see 'dwork profiles')"
+  P_NAME="$profile"
+  P_KIND="" P_DESCRIPTION="" P_BASE="" P_HTTP_PORT="" P_APP_CMD=""
+  P_AUTH_USER_ENV="" P_AUTH_PASS_ENV=""
+  eval "$(sed -n 's/^DWORK_\([A-Z_]*=\)/P_\1/p' "$file")"
+  case "$P_KIND" in
+    x11)   P_BASE="${P_BASE:-x11}"; P_HTTP_PORT="${P_HTTP_PORT:-6080}" ;;
+    web)   P_BASE="${P_BASE:-base}"; [ -n "$P_HTTP_PORT" ] || die "profile $profile: DWORK_HTTP_PORT missing" ;;
+    shell) P_BASE="${P_BASE:-base}" ;;
+    *)     die "profile $profile: DWORK_KIND must be x11, web or shell" ;;
+  esac
+  P_HAS_DOCKERFILE=0
+  if [ -f "$PROFILES_DIR/$profile/Dockerfile" ]; then P_HAS_DOCKERFILE=1; fi
+}
+
+profile_image() {
+  # Profiles without a Dockerfile simply use their base image.
+  if [ "$P_HAS_DOCKERFILE" = 1 ]; then
+    echo "dwork-${P_NAME}:${UID_NUM}-${GID_NUM}"
+  else
+    echo "dwork-${P_BASE}:${UID_NUM}-${GID_NUM}"
+  fi
+}
+
+cmd_profiles() {
+  local p
+  printf '%-12s %-6s %s\n' "PROFILE" "KIND" "DESCRIPTION"
+  for p in "$PROFILES_DIR"/*/; do
+    p="$(basename "$p")"
+    load_profile "$p"
+    printf '%-12s %-6s %s\n' "$p" "$P_KIND" "$P_DESCRIPTION"
+  done
+}
+
+# ---------------------------------------------------------------------------
+# build
+# ---------------------------------------------------------------------------
+
+build_images() {
+  local profile="$1"; shift
+  local pull=() extra=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --pull) pull=(--pull) ;;
+      --build-arg) extra+=(--build-arg "$2"); shift ;;
+      *) die "build: unknown option $1" ;;
+    esac
+    shift
+  done
+  load_profile "$profile"
+  host_ids
+
+  local base_image="dwork-base:${UID_NUM}-${GID_NUM}"
+  info "Building $base_image"
+  docker build "${pull[@]}" \
+    --build-arg UID="$UID_NUM" --build-arg GID="$GID_NUM" \
+    -t "$base_image" "$IMAGES_DIR/base"
+
+  local parent="$base_image"
+  if [ "$P_BASE" = x11 ]; then
+    parent="dwork-x11:${UID_NUM}-${GID_NUM}"
+    info "Building $parent"
+    docker build --build-arg BASE_IMAGE="$base_image" -t "$parent" "$IMAGES_DIR/x11"
+  fi
+
+  if [ "$P_HAS_DOCKERFILE" = 1 ]; then
+    local image; image="$(profile_image)"
+    info "Building $image"
+    docker build --build-arg BASE_IMAGE="$parent" "${extra[@]}" -t "$image" "$PROFILES_DIR/$profile"
+  fi
+}
+
+cmd_build() {
+  [ $# -ge 1 ] || die "usage: dwork build PROFILE [--pull] [--build-arg K=V]..."
+  require_docker
+  build_images "$@"
+  echo
+  echo "Restart instances using this profile to pick up the new image: dwork restart NAME"
+}
+
+# ---------------------------------------------------------------------------
+# credentials
+# ---------------------------------------------------------------------------
+
+prompt_password() {
+  local p1 p2
+  while true; do
+    read -r -s -p "Password for $1: " p1; echo
+    [ -n "$p1" ] || { echo "Password cannot be empty" >&2; continue; }
+    case "$p1" in *\'*) echo "Password must not contain single quotes" >&2; continue ;; esac
+    read -r -s -p "Confirm password: " p2; echo
+    [ "$p1" = "$p2" ] && break
+    echo "Passwords do not match" >&2
+  done
+  PASSWORD="$p1"
+}
+
+write_htpasswd() {
+  local name="$1" user="$2" password="$3"
+  # nginx workers run unprivileged inside the proxy container, so the hash files
+  # must be world-readable there; the parent $PROXY_DIR is 0700 on the host.
+  install -d -m 700 "$PROXY_DIR"
+  install -d -m 755 "$PROXY_DIR/auth"
+  local hash; hash="$(openssl passwd -6 -stdin <<<"$password")"
+  printf '%s:%s\n' "$user" "$hash" > "$PROXY_DIR/auth/$name.htpasswd"
+  chmod 644 "$PROXY_DIR/auth/$name.htpasswd"
+}
+
+# ---------------------------------------------------------------------------
+# create
+# ---------------------------------------------------------------------------
+
+cmd_create() {
+  local name="" profile="" host_port="" proxy=1 user="${USER:-$(id -un)}"
+  local geometry="$DEFAULT_GEOMETRY" app_cmd="" start=1
+  local mounts=()
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --profile|-p) profile="$2"; shift ;;
+      --mount|-m)   mounts+=("$2"); shift ;;
+      --port)       host_port="$2"; shift ;;
+      --no-proxy)   proxy=0 ;;
+      --user)       user="$2"; shift ;;
+      --geometry)   geometry="$2"; shift ;;
+      --app-cmd)    app_cmd="$2"; shift ;;
+      --no-start)   start=0 ;;
+      -h|--help)    usage; exit 0 ;;
+      -*)           die "create: unknown option $1" ;;
+      *)            [ -z "$name" ] || die "create: unexpected argument $1"; name="$1" ;;
+    esac
+    shift
+  done
+
+  [ -n "$name" ] || die "usage: dwork create NAME --profile P [options]"
+  [ -n "$profile" ] || die "create: --profile is required (see 'dwork profiles')"
+  valid_name "$name" || die "name must be lowercase letters, digits and hyphens"
+  [ -z "$host_port" ] || valid_port "$host_port" || die "invalid --port"
+  [[ "$geometry" =~ ^[0-9]+x[0-9]+$ ]] || die "invalid --geometry, expected WxH"
+  [[ "$user" =~ ^[A-Za-z0-9._@-]+$ ]] || die "invalid --user"
+  require_docker
+  load_profile "$profile"
+  host_ids
+
+  local dir; dir="$(instance_dir "$name")"
+  ! instance_exists "$name" || die "instance $name already exists"
+  ! docker container inspect "$name" >/dev/null 2>&1 || die "a container named $name already exists"
+  [ "$P_KIND" != shell ] || { proxy=0; host_port=""; }
+  [ -n "$app_cmd" ] || app_cmd="$P_APP_CMD"
+
+  # Resolve mounts: HOST[:CONTAINER]
+  local m host cont workdir="/home/hostuser" volume_lines=""
+  local -A seen_targets=()
+  for m in "${mounts[@]}"; do
+    host="${m%%:*}"
+    cont=""
+    [ "$host" != "$m" ] && cont="${m#*:}"
+    [ -d "$host" ] || die "mount source does not exist or is not a directory: $host"
+    host="$(cd "$host" && pwd)"
+    [ -n "$cont" ] || cont="/work/$(basename "$host")"
+    [[ "$cont" = /* ]] || die "container mount path must be absolute: $cont"
+    [ -z "${seen_targets[$cont]:-}" ] || die "duplicate container mount path: $cont"
+    seen_targets[$cont]=1
+    [ "$workdir" != "/home/hostuser" ] || workdir="$cont"
+    volume_lines+="      - type: bind"$'\n'
+    volume_lines+="        source: $host"$'\n'
+    volume_lines+="        target: $cont"$'\n'
+  done
+
+  # Credentials (proxy login, optionally fed into the app as well)
+  local password=""
+  if [ "$proxy" = 1 ] || [ -n "$P_AUTH_PASS_ENV" ]; then
+    echo "Login for https://$name.localhost:$HTTPS_PORT (user: $user)"
+    prompt_password "$user"; password="$PASSWORD"; unset PASSWORD
+  fi
+
+  build_images "$profile"
+  local image; image="$(profile_image)"
+
+  if docker volume inspect "dwork-$name-home" >/dev/null 2>&1; then
+    warn "reusing existing home volume dwork-$name-home"
+  fi
+
+  info "Writing $dir"
+  install -d -m 700 "$dir"
+
+  {
+    echo "# dwork instance settings; consumed by compose.yaml and the dwork CLI."
+    env_line DWORK_NAME "$name"
+    env_line DWORK_PROFILE "$profile"
+    env_line DWORK_KIND "$P_KIND"
+    env_line DWORK_IMAGE "$image"
+    env_line DWORK_HTTP_PORT "${P_HTTP_PORT:-0}"
+    env_line DWORK_HOST_PORT "${host_port:-}"
+    env_line DWORK_PROXY "$proxy"
+    env_line DWORK_USER "$user"
+    env_line DWORK_APP_CMD "$app_cmd"
+    env_line DWORK_APP_AUTOSTART "$([ -n "$app_cmd" ] && echo true || echo false)"
+    env_line DWORK_GEOMETRY "$geometry"
+  } > "$dir/.env"
+
+  {
+    echo "# Secrets for instance $name (loaded as container environment)."
+    if [ -n "$P_AUTH_USER_ENV" ]; then env_line "$P_AUTH_USER_ENV" "$user"; fi
+    if [ -n "$P_AUTH_PASS_ENV" ]; then env_line "$P_AUTH_PASS_ENV" "$password"; fi
+  } > "$dir/secrets.env"
+  chmod 600 "$dir/secrets.env"
+
+  write_compose "$dir" "$workdir" "$volume_lines"
+
+  if [ "$proxy" = 1 ]; then
+    write_htpasswd "$name" "$user" "$password"
+  fi
+  unset password
+
+  ensure_network
+  if [ "$start" = 1 ]; then
+    info "Starting $name"
+    compose "$name" up -d
+    if [ "$proxy" = 1 ]; then
+      proxy_add "$name"
+    fi
+    echo
+    cmd_url "$name"
+  else
+    echo "Instance written. Start it with: dwork start $name"
+  fi
+}
+
+write_compose() {
+  local dir="$1" workdir="$2" volume_lines="$3"
+  local ports="" shm="" x11env=""
+
+  load_instance "$(basename "$dir")"
+
+  if [ -n "$DW_HOST_PORT" ]; then
+    ports="    ports:"$'\n'"      - \"127.0.0.1:\${DWORK_HOST_PORT}:\${DWORK_HTTP_PORT}\""$'\n'
+  fi
+  if [ "$DW_KIND" = x11 ]; then
+    shm="    shm_size: 1g"$'\n'
+    x11env="      DWORK_GEOMETRY: \${DWORK_GEOMETRY}"$'\n'
+  fi
+
+  cat > "$dir/compose.yaml" <<EOF
+# Generated by dwork for instance ${DW_NAME} (profile: ${DW_PROFILE}).
+# Safe to edit: extra mounts, devices, environment... Apply with: dwork restart ${DW_NAME}
+# Values in \${...} come from .env in this directory.
+name: dwork-${DW_NAME}
+
+services:
+  app:
+    image: \${DWORK_IMAGE}
+    container_name: ${DW_NAME}
+    hostname: ${DW_NAME}
+    init: true
+    restart: unless-stopped
+${shm}    env_file:
+      - secrets.env
+    environment:
+      DWORK_APP_CMD: '\${DWORK_APP_CMD}'
+      DWORK_APP_AUTOSTART: '\${DWORK_APP_AUTOSTART}'
+${x11env}    working_dir: ${workdir}
+    volumes:
+      - type: volume
+        source: home
+        target: /home/hostuser
+${volume_lines}${ports}    labels:
+      dwork.instance: ${DW_NAME}
+      dwork.profile: ${DW_PROFILE}
+      dwork.kind: ${DW_KIND}
+    networks:
+      - ${NETWORK_NAME}
+
+volumes:
+  home:
+    name: dwork-${DW_NAME}-home
+
+networks:
+  ${NETWORK_NAME}:
+    external: true
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# lifecycle
+# ---------------------------------------------------------------------------
+
+cmd_start() {
+  require_instance "$1"; require_docker; ensure_network
+  compose "$1" up -d
+}
+
+cmd_stop() {
+  require_instance "$1"; require_docker
+  compose "$1" stop
+}
+
+cmd_restart() {
+  require_instance "$1"; require_docker; ensure_network
+  # `up -d` recreates the container if the image or compose.yaml changed.
+  compose "$1" up -d --force-recreate
+}
+
+cmd_bash() {
+  local name="$1"; shift
+  require_instance "$name"; require_docker
+  if ! container_running "$name"; then
+    info "Starting $name"
+    ensure_network
+    compose "$name" up -d >/dev/null
+  fi
+  local tty=()
+  [ -t 0 ] && tty=(-it)
+  if [ $# -eq 0 ]; then
+    exec docker exec "${tty[@]}" -e TERM="${TERM:-xterm}" "$name" bash -l
+  else
+    exec docker exec "${tty[@]}" -e TERM="${TERM:-xterm}" "$name" bash -lc "$*"
+  fi
+}
+
+cmd_app() {
+  local name="$1" action="${2:-status}"
+  require_instance "$name"; require_docker
+  container_running "$name" || die "$name is not running (dwork start $name)"
+  case "$action" in
+    start|stop|restart|status) docker exec "$name" supervisorctl "$action" app ;;
+    *) die "usage: dwork app NAME start|stop|restart|status" ;;
+  esac
+}
+
+cmd_logs() {
+  local name="$1" program="${2:-app}"
+  require_instance "$name"; require_docker
+  container_running "$name" || die "$name is not running (dwork start $name)"
+  [[ "$program" =~ ^[a-z0-9_-]+$ ]] || die "invalid program name"
+  local tty=()
+  [ -t 0 ] && tty=(-it)
+  exec docker exec "${tty[@]}" "$name" supervisorctl tail -f "$program"
+}
+
+cmd_edit() {
+  require_instance "$1"
+  exec "${EDITOR:-vi}" "$(instance_dir "$1")/compose.yaml"
+}
+
+cmd_url() {
+  require_instance "$1"; load_instance "$1"
+  if [ "$DW_KIND" = shell ]; then
+    echo "$DW_NAME is a shell instance: dwork bash $DW_NAME"
+    return
+  fi
+  if [ "$DW_PROXY" = 1 ]; then
+    echo "URL:     https://${DW_NAME}.localhost:${HTTPS_PORT}"
+    [ -z "${DWORK_DOMAIN:-}" ] || echo "         https://${DW_NAME}.${DWORK_DOMAIN}:${HTTPS_PORT}"
+    echo "Login:   ${DW_USER}"
+    if [ "$PROXY_BIND" = "127.0.0.1" ]; then
+      echo "Tunnel:  ssh -N -L ${HTTPS_PORT}:127.0.0.1:${HTTPS_PORT} ${USER:-user}@$(hostname)"
+    fi
+  fi
+  if [ -n "$DW_HOST_PORT" ]; then
+    echo "Direct:  http://127.0.0.1:${DW_HOST_PORT}  (no TLS, no auth; tunnel it)"
+  fi
+  if [ "$DW_KIND" = x11 ]; then
+    echo "VNC:     inside the container on localhost:5901; noVNC on :${DW_HTTP_PORT}"
+  fi
+}
+
+cmd_status() {
+  require_docker
+  local dir name st
+  printf '%-16s %-10s %-8s %-10s %s\n' "NAME" "PROFILE" "KIND" "STATE" "ACCESS"
+  local found=0
+  for dir in "$INSTANCES_DIR"/*/; do
+    [ -f "$dir/compose.yaml" ] || continue
+    found=1
+    name="$(basename "$dir")"
+    load_instance "$name"
+    st="$(container_status "$name")"
+    local access="dwork bash $name"
+    if [ "$DW_KIND" != shell ]; then
+      if [ "$DW_PROXY" = 1 ]; then
+        access="https://${name}.localhost:${HTTPS_PORT}"
+      elif [ -n "$DW_HOST_PORT" ]; then
+        access="http://127.0.0.1:${DW_HOST_PORT}"
+      else
+        access="(not published)"
+      fi
+    fi
+    printf '%-16s %-10s %-8s %-10s %s\n' "$name" "$DW_PROFILE" "$DW_KIND" "$st" "$access"
+  done
+  [ "$found" = 1 ] || echo "(no instances; create one with 'dwork create NAME --profile P')"
+  echo
+  printf 'proxy: %s %s\n' "$PROXY_NAME" "$(container_status "$PROXY_NAME")"
+  if [ "$(container_status "$PROXY_NAME")" != absent ]; then
+    echo "       listening on ${PROXY_BIND}:${HTTPS_PORT}"
+  fi
+}
+
+cmd_rm() {
+  local name="" purge=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --purge) purge=1 ;;
+      -*) die "rm: unknown option $1" ;;
+      *) name="$1" ;;
+    esac
+    shift
+  done
+  [ -n "$name" ] || die "usage: dwork rm NAME [--purge]"
+  require_instance "$name"; require_docker; load_instance "$name"
+
+  if [ "$DW_PROXY" = 1 ]; then proxy_rm "$name" || true; fi
+  info "Removing container $name"
+  if [ "$purge" = 1 ]; then
+    compose "$name" down --volumes --remove-orphans
+  else
+    compose "$name" down --remove-orphans
+    echo "Home volume dwork-$name-home kept (reused if you create '$name' again; --purge deletes it)"
+  fi
+  rm -rf "$(instance_dir "$name")"
+  rm -f "$PROXY_DIR/auth/$name.htpasswd" "$PROXY_DIR/certs/$name".{crt,key} "$PROXY_DIR/conf.d/$name.conf"
+  info "Removed $name"
+}
+
+# ---------------------------------------------------------------------------
+# proxy
+# ---------------------------------------------------------------------------
+
+proxy_init() {
+  require_command openssl
+  install -d -m 700 "$PROXY_DIR" "$PROXY_DIR/certs"
+  install -d -m 755 "$PROXY_DIR/conf.d" "$PROXY_DIR/auth"
+
+  if [ ! -f "$PROXY_DIR/certs/default.crt" ]; then
+    make_cert default "dwork-proxy"
+  fi
+
+  cat > "$PROXY_DIR/conf.d/00-default.conf" <<'EOF'
+# Generated by dwork. Shared settings and a catch-all that rejects unknown hosts.
+map $http_upgrade $connection_upgrade {
+    default upgrade;
+    ''      close;
+}
+
+server {
+    listen 443 ssl default_server;
+    server_name _;
+    ssl_certificate     /etc/nginx/certs/default.crt;
+    ssl_certificate_key /etc/nginx/certs/default.key;
+    return 444;
+}
+EOF
+
+  cat > "$PROXY_DIR/compose.yaml" <<EOF
+# Generated by dwork: shared HTTPS proxy in front of all instances.
+name: dwork-proxy
+
+services:
+  nginx:
+    image: ${PROXY_IMAGE}
+    container_name: ${PROXY_NAME}
+    restart: unless-stopped
+    ports:
+      - "${PROXY_BIND}:${HTTPS_PORT}:443"
+    volumes:
+      - ./conf.d:/etc/nginx/conf.d:ro
+      - ./certs:/etc/nginx/certs:ro
+      - ./auth:/etc/nginx/auth:ro
+    labels:
+      dwork.kind: proxy
+    networks:
+      - ${NETWORK_NAME}
+
+networks:
+  ${NETWORK_NAME}:
+    external: true
+EOF
+  ensure_network
+}
+
+make_cert() {
+  local name="$1" cn="$2"
+  local san="DNS:${cn}.localhost,DNS:localhost"
+  [ -z "${DWORK_DOMAIN:-}" ] || san+=",DNS:${cn}.${DWORK_DOMAIN}"
+  openssl req -x509 -nodes -newkey rsa:2048 -days 825 \
+    -keyout "$PROXY_DIR/certs/$name.key" -out "$PROXY_DIR/certs/$name.crt" \
+    -subj "/CN=${cn}.localhost" -addext "subjectAltName=${san}" >/dev/null 2>&1
+  chmod 600 "$PROXY_DIR/certs/$name.key"
+}
+
+proxy_compose() {
+  docker compose --project-directory "$PROXY_DIR" "$@"
+}
+
+proxy_reload() {
+  if container_running "$PROXY_NAME"; then
+    docker exec "$PROXY_NAME" nginx -t
+    docker exec "$PROXY_NAME" nginx -s reload
+  else
+    proxy_compose up -d
+  fi
+}
+
+proxy_add() {
+  local name="$1"
+  load_instance "$name"
+  [ "$DW_KIND" != shell ] || die "shell instances have nothing to proxy"
+  proxy_init
+
+  [ -f "$PROXY_DIR/certs/$name.crt" ] || make_cert "$name" "$name"
+  [ -f "$PROXY_DIR/auth/$name.htpasswd" ] || {
+    echo "Login for https://$name.localhost:$HTTPS_PORT (user: $DW_USER)"
+    prompt_password "$DW_USER"; write_htpasswd "$name" "$DW_USER" "$PASSWORD"; unset PASSWORD
+  }
+
+  local root_location=""
+  if [ "$DW_KIND" = x11 ]; then
+    # Land on the noVNC client (the redirect itself carries nothing sensitive;
+    # everything it points to is behind auth_basic).
+    root_location="
+    absolute_redirect off;
+    location = / {
+        return 302 /vnc.html?autoconnect=1&resize=remote&reconnect=1&reconnect_delay=1000;
+    }
+"
+  fi
+
+  cat > "$PROXY_DIR/conf.d/$name.conf" <<EOF
+# Generated by dwork for instance $name (${DW_KIND}).
+server {
+    listen 443 ssl;
+    server_name ${name}.*;
+
+    ssl_certificate     /etc/nginx/certs/${name}.crt;
+    ssl_certificate_key /etc/nginx/certs/${name}.key;
+
+    auth_basic           "dwork ${name}";
+    auth_basic_user_file /etc/nginx/auth/${name}.htpasswd;
+
+    client_max_body_size 0;
+    resolver 127.0.0.11 valid=10s ipv6=off;
+${root_location}
+    location / {
+        set \$upstream http://${name}:${DW_HTTP_PORT};
+        proxy_pass \$upstream;
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection \$connection_upgrade;
+        proxy_buffering off;
+        proxy_read_timeout 1d;
+        proxy_send_timeout 1d;
+    }
+}
+EOF
+
+  if ! container_running "$PROXY_NAME"; then
+    info "Starting $PROXY_NAME on ${PROXY_BIND}:${HTTPS_PORT}"
+    proxy_compose up -d
+  else
+    proxy_reload
+  fi
+  sed -i "s/^DWORK_PROXY=.*/DWORK_PROXY='1'/" "$(instance_dir "$name")/.env"
+}
+
+proxy_rm() {
+  local name="$1"
+  rm -f "$PROXY_DIR/conf.d/$name.conf"
+  if [ -f "$(instance_dir "$name")/.env" ]; then
+    sed -i "s/^DWORK_PROXY=.*/DWORK_PROXY='0'/" "$(instance_dir "$name")/.env"
+  fi
+  container_running "$PROXY_NAME" && proxy_reload
+  return 0
+}
+
+cmd_proxy() {
+  local action="${1:-status}"; shift || true
+  require_docker
+  case "$action" in
+    add)    require_instance "${1:-}"; proxy_add "$1"; echo; cmd_url "$1" ;;
+    rm)     require_instance "${1:-}"; proxy_rm "$1" ;;
+    passwd)
+      require_instance "${1:-}"; load_instance "$1"
+      prompt_password "$DW_USER"; write_htpasswd "$1" "$DW_USER" "$PASSWORD"
+      if [ -f "$(instance_dir "$1")/secrets.env" ]; then
+        load_profile "$DW_PROFILE"
+        if [ -n "$P_AUTH_PASS_ENV" ]; then
+          { env_line "$P_AUTH_USER_ENV" "$DW_USER"; env_line "$P_AUTH_PASS_ENV" "$PASSWORD"; } \
+            > "$(instance_dir "$1")/secrets.env"
+          echo "Application credentials updated; apply with: dwork restart $1"
+        fi
+      fi
+      unset PASSWORD
+      echo "Proxy login updated (takes effect immediately)"
+      ;;
+    reload) [ -f "$PROXY_DIR/compose.yaml" ] || die "proxy not set up"; proxy_reload ;;
+    status)
+      echo "proxy: $PROXY_NAME $(container_status "$PROXY_NAME") on ${PROXY_BIND}:${HTTPS_PORT}"
+      echo "vhosts:"
+      ls "$PROXY_DIR/conf.d" 2>/dev/null | grep -v '^00-default' | sed 's/\.conf$//; s/^/  /' || true
+      ;;
+    logs)   exec docker logs -f "$PROXY_NAME" ;;
+    *)      die "usage: dwork proxy add|rm|passwd NAME | reload|status|logs" ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# main
+# ---------------------------------------------------------------------------
+
+main() {
+  [ $# -ge 1 ] || { usage; exit 1; }
+  local cmd="$1"; shift
+  case "$cmd" in
+    create)   cmd_create "$@" ;;
+    start)    [ $# -eq 1 ] || die "usage: dwork start NAME";   cmd_start "$1" ;;
+    stop)     [ $# -eq 1 ] || die "usage: dwork stop NAME";    cmd_stop "$1" ;;
+    restart)  [ $# -eq 1 ] || die "usage: dwork restart NAME"; cmd_restart "$1" ;;
+    bash|sh|exec) [ $# -ge 1 ] || die "usage: dwork bash NAME [CMD...]"; cmd_bash "$@" ;;
+    app)      [ $# -ge 1 ] || die "usage: dwork app NAME start|stop|restart|status"; cmd_app "$@" ;;
+    logs)     [ $# -ge 1 ] || die "usage: dwork logs NAME [PROGRAM]"; cmd_logs "$@" ;;
+    url)      [ $# -eq 1 ] || die "usage: dwork url NAME"; cmd_url "$1" ;;
+    status|ls) cmd_status ;;
+    rm)       cmd_rm "$@" ;;
+    edit)     [ $# -eq 1 ] || die "usage: dwork edit NAME"; cmd_edit "$1" ;;
+    profiles) cmd_profiles ;;
+    build)    cmd_build "$@" ;;
+    proxy)    cmd_proxy "$@" ;;
+    help|-h|--help) usage ;;
+    *) die "unknown command: $cmd (try 'dwork help')" ;;
+  esac
+}
+
+main "$@"
