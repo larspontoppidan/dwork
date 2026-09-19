@@ -25,6 +25,7 @@ ln -s "$PWD/dwork" ~/.local/bin/dwork
 dwork profiles
 dwork create zc --profile zcode --mount ~/proj              # X11 app over VNC on 127.0.0.1:5901
 dwork create oc --profile opencode --mount ~/proj --port 14096   # web app on 127.0.0.1:14096
+dwork create pi --profile pi --mount ~/proj                 # Pi TUI: dwork bash pi, then run pi
 dwork create box --profile shell --mount ~/proj --mount ~/data:/data
 
 dwork status
