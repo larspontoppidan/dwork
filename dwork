@@ -46,6 +46,7 @@ Instances
   logs NAME [PROGRAM]                 follow logs (default: app; x11: xvnc, openbox)
   url NAME                            print access URLs and the ssh tunnel command
   status                              list instances
+  volumes [prune [--force]]           list managed home volumes or remove orphaned ones
   rm NAME [--purge]                   remove instance (--purge also deletes the home volume)
   edit NAME                           open the instance compose.yaml in \$EDITOR
 
@@ -433,6 +434,10 @@ ${volume_lines}${ports}    labels:
 volumes:
   home:
     name: dwork-${DW_NAME}-home
+    labels:
+      dwork.managed: "true"
+      dwork.instance: ${DW_NAME}
+      dwork.purpose: home
 EOF
 }
 
@@ -522,8 +527,9 @@ cmd_url() {
 
 cmd_status() {
   require_docker
-  local dir name st
-  printf '%-16s %-10s %-8s %-10s %s\n' "NAME" "PROFILE" "KIND" "STATE" "ACCESS"
+  local dir name st home
+  printf '%-16s %-10s %-8s %-10s %-34s %s\n' \
+    "NAME" "PROFILE" "KIND" "STATE" "ACCESS" "HOME VOLUME"
   local found=0
   for dir in "$INSTANCES_DIR"/*/; do
     [ -f "$dir/compose.yaml" ] || continue
@@ -531,6 +537,8 @@ cmd_status() {
     name="$(basename "$dir")"
     load_instance "$name"
     st="$(container_status "$name")"
+    home="dwork-$name-home"
+    docker volume inspect "$home" >/dev/null 2>&1 || home="$home (missing)"
     local access="dwork bash $name"
     if [ "$DW_KIND" = x11 ] && [ -n "$DW_VNC_HOST_PORT" ]; then
       access="vnc://127.0.0.1:${DW_VNC_HOST_PORT}"
@@ -541,9 +549,86 @@ cmd_status() {
         access="(not published)"
       fi
     fi
-    printf '%-16s %-10s %-8s %-10s %s\n' "$name" "$DW_PROFILE" "$DW_KIND" "$st" "$access"
+    printf '%-16s %-10s %-8s %-10s %-34s %s\n' \
+      "$name" "$DW_PROFILE" "$DW_KIND" "$st" "$access" "$home"
   done
   [ "$found" = 1 ] || echo "(no instances; create one with 'dwork create NAME --profile P')"
+}
+
+managed_volumes() {
+  docker volume ls --filter label=dwork.managed=true --format '{{.Name}}'
+}
+
+volume_instance() {
+  docker volume inspect -f '{{ index .Labels "dwork.instance" }}' "$1"
+}
+
+volume_consumers() {
+  docker ps -a --filter "volume=$1" --format '{{.Names}}' | paste -sd, -
+}
+
+volume_state() {
+  local volume="$1" instance="$2" consumers
+  consumers="$(volume_consumers "$volume")"
+  if [ -n "$consumers" ]; then
+    echo "attached:$consumers"
+  elif valid_name "$instance" && instance_exists "$instance"; then
+    echo "retained"
+  else
+    echo "orphaned"
+  fi
+}
+
+cmd_volumes() {
+  local action="${1:-list}" force=0 volume instance state
+  shift || true
+  if [ "$action" = prune ]; then
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --force) force=1 ;;
+        *) die "usage: dwork volumes [prune [--force]]" ;;
+      esac
+      shift
+    done
+  elif [ "$action" != list ] || [ $# -gt 0 ]; then
+    die "usage: dwork volumes [prune [--force]]"
+  fi
+
+  require_docker
+  local volumes=() orphans=() volume_list
+  volume_list="$(managed_volumes)" || die "failed to list Docker volumes"
+  if [ -n "$volume_list" ]; then
+    mapfile -t volumes <<<"$volume_list"
+  fi
+
+  if [ "$action" = list ]; then
+    printf '%-28s %-16s %s\n' "VOLUME" "INSTANCE" "STATE"
+    for volume in "${volumes[@]}"; do
+      instance="$(volume_instance "$volume")"
+      state="$(volume_state "$volume" "$instance")"
+      printf '%-28s %-16s %s\n' "$volume" "${instance:--}" "$state"
+    done
+    [ "${#volumes[@]}" -gt 0 ] || echo "(no managed volumes)"
+    return
+  fi
+
+  for volume in "${volumes[@]}"; do
+    instance="$(volume_instance "$volume")"
+    [ "$(volume_state "$volume" "$instance")" = orphaned ] && orphans+=("$volume")
+  done
+  if [ "${#orphans[@]}" -eq 0 ]; then
+    echo "No orphaned dwork volumes."
+    return
+  fi
+
+  printf 'Orphaned volumes:\n'
+  printf '  %s\n' "${orphans[@]}"
+  if [ "$force" != 1 ]; then
+    local answer
+    read -r -p "Delete these ${#orphans[@]} volume(s)? [y/N] " answer
+    case "$answer" in y|Y|yes|YES) ;; *) echo "Cancelled."; return ;; esac
+  fi
+  docker volume rm "${orphans[@]}"
 }
 
 cmd_rm() {
@@ -586,6 +671,7 @@ main() {
     logs)     [ $# -ge 1 ] || die "usage: dwork logs NAME [PROGRAM]"; cmd_logs "$@" ;;
     url)      [ $# -eq 1 ] || die "usage: dwork url NAME"; cmd_url "$1" ;;
     status|ls) cmd_status ;;
+    volumes)  cmd_volumes "$@" ;;
     rm)       cmd_rm "$@" ;;
     edit)     [ $# -eq 1 ] || die "usage: dwork edit NAME"; cmd_edit "$1" ;;
     profiles) cmd_profiles ;;

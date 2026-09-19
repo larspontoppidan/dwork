@@ -59,7 +59,8 @@ ssh -N -L 5901:127.0.0.1:5901 user@server
 | `app NAME start\|stop\|restart\|status` | control the supervised application |
 | `logs NAME [PROGRAM]` | follow logs; programs: `app`, and for x11 `xvnc`, `openbox` |
 | `url NAME` | print the URLs and the ssh tunnel command |
-| `status` | list instances |
+| `status` | list instances and their home volumes |
+| `volumes [prune [--force]]` | list labeled home volumes or remove orphaned ones |
 | `rm NAME [--purge]` | remove the instance; the home volume is kept unless `--purge` |
 | `edit NAME` | open the instance `compose.yaml` in `$EDITOR` |
 | `build PROFILE [--pull] [--build-arg K=V]` | (re)build base, x11 and profile images |
@@ -84,6 +85,12 @@ Each instance is a small docker compose project generated into
   devices, env vars…) and run `dwork restart NAME`.
 - `.env` – settings referenced by the compose file and by the CLI.
 - `secrets.env` – credentials passed to the container (mode 600).
+
+Home volumes are labeled with their owning instance. `dwork volumes` reports
+them as `attached` (used by a container), `retained` (the instance exists but
+its container does not), or `orphaned` (no container or instance remains).
+`dwork volumes prune` removes only labeled orphaned volumes and asks for
+confirmation; pass `--force` for non-interactive use.
 
 Access paths:
 
@@ -111,6 +118,9 @@ DWORK_AUTH_PASS_ENV=OPENCODE_SERVER_PASSWORD
 Included profiles:
 
 - `shell` – plain dev box, no service.
+- `pi` – Pi terminal coding harness. Enter with `dwork bash NAME`, run `pi`,
+  then use `/login` to authenticate a provider. Its configuration, provider
+  credentials, packages and sessions persist in the instance home volume.
 - `opencode` – OpenCode web UI, installed into the image.
 - `zcode` – ZCode (Z.ai desktop app, Electron) from the official Linux `.deb`,
   started with `--no-sandbox --disable-gpu`. Ships Firefox so the "Connect to
