@@ -13,9 +13,8 @@ app), or nothing at all (a plain **shell** box). Every instance:
 - stays up even if the application crashes: `supervisord` is PID 1 and the app
   is a supervised program you can restart from inside or outside
 - web instances publish their app on `127.0.0.1:HOSTPORT` (`--port`); X11
-  instances are a VNC desktop on `127.0.0.1:5901`. Pass `--proxy` to put a web
-  instance behind the shared nginx (TLS + basic auth) at
-  `https://NAME.localhost:4443` instead.
+  instances are a VNC desktop on `127.0.0.1:5901`. Both are intended to be
+  reached remotely through SSH port forwarding.
 
 ## Quick start
 
@@ -50,30 +49,20 @@ ssh -N -L 5901:127.0.0.1:5901 user@server
 # then connect a VNC client to 127.0.0.1:5901
 ```
 
-`create --proxy` (web only) also attaches the instance to a shared nginx with
-TLS and HTTP basic auth on `127.0.0.1:4443`. One tunnel then serves every
-proxied name (`https://NAME.localhost:4443`; browsers resolve `*.localhost` to
-`127.0.0.1`). You can add or remove that later with `dwork proxy add|rm NAME`.
-
-Set `DWORK_PROXY_BIND=0.0.0.0` (and ideally `DWORK_DOMAIN=myserver.lan`, which
-adds `NAME.myserver.lan` to the certificates) to expose the proxy on a LAN/VPN
-interface instead. The vhost matches `NAME.*`, so any suffix works.
-
 ## Commands
 
 | Command | What it does |
 | --- | --- |
-| `create NAME --profile P [--mount H[:C]]... [--port N] [--vnc-port N] [--no-vnc] [--proxy] [--user U] [--geometry WxH] [--app-cmd CMD]` | build images, write the instance, start it (web: pass `--port` or `--proxy`) |
+| `create NAME --profile P [--mount H[:C]]... [--port N] [--vnc-port N] [--no-vnc] [--user U] [--geometry WxH] [--app-cmd CMD]` | build images, write the instance, start it (web: pass `--port`) |
 | `start` / `stop` / `restart NAME` | container lifecycle (`restart` also picks up rebuilt images and edits to `compose.yaml`) |
 | `bash NAME [CMD...]` | interactive shell inside (starts the container if needed) |
 | `app NAME start\|stop\|restart\|status` | control the supervised application |
 | `logs NAME [PROGRAM]` | follow logs; programs: `app`, and for x11 `xvnc`, `openbox` |
 | `url NAME` | print the URLs and the ssh tunnel command |
-| `status` | list instances and the proxy |
+| `status` | list instances |
 | `rm NAME [--purge]` | remove the instance; the home volume is kept unless `--purge` |
 | `edit NAME` | open the instance `compose.yaml` in `$EDITOR` |
 | `build PROFILE [--pull] [--build-arg K=V]` | (re)build base, x11 and profile images |
-| `proxy add\|rm\|passwd NAME`, `proxy reload\|status\|logs` | manage the shared nginx |
 
 Inside a container the same controls exist: `supervisorctl status`,
 `supervisorctl restart app`, `supervisorctl tail -f app`. In X11 containers
@@ -96,17 +85,11 @@ Each instance is a small docker compose project generated into
 - `.env` – settings referenced by the compose file and by the CLI.
 - `secrets.env` – credentials passed to the container (mode 600).
 
-The proxy is another compose project in `~/.config/dwork/proxy/` with one
-generated vhost, self-signed certificate and htpasswd file per web instance. All
-containers share the `dwork-web` Docker network; nginx resolves `NAME` at
-request time, so instances can be down without breaking the proxy config.
-
 Access paths:
 
 ```
 VNC client ──▶ 127.0.0.1:5901 ──▶ NAME:5901 (x11: Xtigervnc, no password)
 browser ──▶ 127.0.0.1:HOSTPORT ──▶ NAME:4096   (web, default: --port)
-browser ──https+auth──▶ nginx ──http──▶ NAME:4096   (web with --proxy)
 ```
 
 ## Profiles
@@ -119,10 +102,10 @@ image needs anything installed, a `Dockerfile` that starts with
 # profiles/opencode/profile.env
 DWORK_KIND=web                      # x11 | web | shell
 DWORK_DESCRIPTION="OpenCode web UI"
-DWORK_HTTP_PORT=4096                # app listen port (web: --port and/or nginx)
-DWORK_APP_CMD="opencode web --hostname 0.0.0.0 --port 4096"
-DWORK_AUTH_USER_ENV=OPENCODE_SERVER_USERNAME   # optional: feed the proxy login
-DWORK_AUTH_PASS_ENV=OPENCODE_SERVER_PASSWORD   #           to the app as env vars
+DWORK_HTTP_PORT=4096                # app listen port (published with --port)
+DWORK_APP_CMD="opencode serve --hostname 0.0.0.0 --port 4096"
+DWORK_AUTH_USER_ENV=OPENCODE_SERVER_USERNAME   # optional native app login
+DWORK_AUTH_PASS_ENV=OPENCODE_SERVER_PASSWORD
 ```
 
 Included profiles:
@@ -151,9 +134,6 @@ apps generally need `--no-sandbox`; the compose file already sets
   mount, not as root.
 - After `dwork build P`, `dwork restart NAME` recreates the container from the
   new image. Home volumes and mounts are untouched.
-- Certificates are self-signed (`~/.config/dwork/proxy/certs/NAME.crt`);
-  import one into your browser's trust store to silence the warning, or replace
-  the pair with a real certificate and run `dwork proxy reload`.
 - VNC is published on `127.0.0.1` with no password. Do not change the bind to
   `0.0.0.0` unless you add VNC authentication first. Use `--vnc-port` when you
   have more than one X11 instance.
