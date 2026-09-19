@@ -12,9 +12,10 @@ app), or nothing at all (a plain **shell** box). Every instance:
   directories under `/work/...`
 - stays up even if the application crashes: `supervisord` is PID 1 and the app
   is a supervised program you can restart from inside or outside
-- web instances are reachable through one shared nginx proxy with TLS and HTTP
-  basic auth at `https://NAME.localhost:4443`; X11 instances are a VNC desktop
-  on `127.0.0.1:5901`
+- web instances publish their app on `127.0.0.1:HOSTPORT` (`--port`); X11
+  instances are a VNC desktop on `127.0.0.1:5901`. Pass `--proxy` to put a web
+  instance behind the shared nginx (TLS + basic auth) at
+  `https://NAME.localhost:4443` instead.
 
 ## Quick start
 
@@ -24,7 +25,7 @@ ln -s "$PWD/dwork" ~/.local/bin/dwork
 
 dwork profiles
 dwork create zc --profile zcode --mount ~/proj              # X11 app over VNC on 127.0.0.1:5901
-dwork create oc --profile opencode --mount ~/proj --port 14096   # web app (+ direct port)
+dwork create oc --profile opencode --mount ~/proj --port 14096   # web app on 127.0.0.1:14096
 dwork create box --profile shell --mount ~/proj --mount ~/data:/data
 
 dwork status
@@ -32,34 +33,37 @@ dwork url zc
 dwork bash zc
 ```
 
-For web profiles, `create` prompts once for a password. That login protects the
-proxy vhost and, for profiles that support it (OpenCode), is also handed to the
-application so a single login works end to end.
+For web profiles that support it (OpenCode), `create` prompts once for a
+password and hands it to the application. From your workstation, SSH-forward
+the published port:
+
+```sh
+ssh -N -L 14096:127.0.0.1:14096 user@server
+# then open http://127.0.0.1:14096
+```
 
 X11 instances publish TigerVNC on `127.0.0.1:5901` (override with `--vnc-port`).
-There is no VNC password; the bind is localhost-only. From your workstation:
+There is no VNC password; the bind is localhost-only:
 
 ```sh
 ssh -N -L 5901:127.0.0.1:5901 user@server
 # then connect a VNC client to 127.0.0.1:5901
 ```
 
-The shared HTTPS proxy (web apps only) binds to `127.0.0.1:4443` by default:
-
-```sh
-ssh -N -L 4443:127.0.0.1:4443 user@server
-# then open https://oc.localhost:4443 (browsers resolve *.localhost to 127.0.0.1)
-```
+`create --proxy` (web only) also attaches the instance to a shared nginx with
+TLS and HTTP basic auth on `127.0.0.1:4443`. One tunnel then serves every
+proxied name (`https://NAME.localhost:4443`; browsers resolve `*.localhost` to
+`127.0.0.1`). You can add or remove that later with `dwork proxy add|rm NAME`.
 
 Set `DWORK_PROXY_BIND=0.0.0.0` (and ideally `DWORK_DOMAIN=myserver.lan`, which
-adds `NAME.myserver.lan` to the certificates) to expose it on a LAN/VPN
+adds `NAME.myserver.lan` to the certificates) to expose the proxy on a LAN/VPN
 interface instead. The vhost matches `NAME.*`, so any suffix works.
 
 ## Commands
 
 | Command | What it does |
 | --- | --- |
-| `create NAME --profile P [--mount H[:C]]... [--port N] [--vnc-port N] [--no-vnc] [--no-proxy] [--user U] [--geometry WxH] [--app-cmd CMD]` | build images, write the instance, start it (web: add the HTTPS proxy) |
+| `create NAME --profile P [--mount H[:C]]... [--port N] [--vnc-port N] [--no-vnc] [--proxy] [--user U] [--geometry WxH] [--app-cmd CMD]` | build images, write the instance, start it (web: pass `--port` or `--proxy`) |
 | `start` / `stop` / `restart NAME` | container lifecycle (`restart` also picks up rebuilt images and edits to `compose.yaml`) |
 | `bash NAME [CMD...]` | interactive shell inside (starts the container if needed) |
 | `app NAME start\|stop\|restart\|status` | control the supervised application |
@@ -101,7 +105,8 @@ Access paths:
 
 ```
 VNC client ──▶ 127.0.0.1:5901 ──▶ NAME:5901 (x11: Xtigervnc, no password)
-browser ──https+auth──▶ nginx ──http──▶ NAME:4096   (web: the app itself)
+browser ──▶ 127.0.0.1:HOSTPORT ──▶ NAME:4096   (web, default: --port)
+browser ──https+auth──▶ nginx ──http──▶ NAME:4096   (web with --proxy)
 ```
 
 ## Profiles
@@ -114,7 +119,7 @@ image needs anything installed, a `Dockerfile` that starts with
 # profiles/opencode/profile.env
 DWORK_KIND=web                      # x11 | web | shell
 DWORK_DESCRIPTION="OpenCode web UI"
-DWORK_HTTP_PORT=4096                # what nginx proxies to (web only)
+DWORK_HTTP_PORT=4096                # app listen port (web: --port and/or nginx)
 DWORK_APP_CMD="opencode web --hostname 0.0.0.0 --port 4096"
 DWORK_AUTH_USER_ENV=OPENCODE_SERVER_USERNAME   # optional: feed the proxy login
 DWORK_AUTH_PASS_ENV=OPENCODE_SERVER_PASSWORD   #           to the app as env vars

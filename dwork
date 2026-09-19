@@ -4,8 +4,9 @@
 #
 # Every instance is a docker compose project generated into
 #   $DWORK_HOME/instances/NAME/   (compose.yaml, .env, secrets.env)
-# Web instances are reachable through a shared nginx proxy (TLS + basic auth)
-# at https://NAME.localhost:4443. X11 instances publish VNC on 127.0.0.1.
+# Web instances publish an HTTP port with --port (SSH-forward that). Pass
+# --proxy to put them behind the shared nginx (TLS + basic auth) instead.
+# X11 instances publish VNC on 127.0.0.1.
 #
 set -euo pipefail
 
@@ -38,11 +39,12 @@ Usage: dwork <command> [args]
 Instances
   create NAME --profile P [options]   create, build and start an instance
       --mount HOST[:CONTAINER]        bind mount (repeatable; default /work/<basename>)
-      --port HOSTPORT                 also publish the app port on 127.0.0.1:HOSTPORT
+      --port HOSTPORT                 publish the app on 127.0.0.1:HOSTPORT (web)
       --vnc-port HOSTPORT             publish VNC on 127.0.0.1:HOSTPORT (x11; default 5901)
       --no-vnc                        do not publish the VNC port
-      --no-proxy                      do not add the instance to the HTTPS proxy
-      --user NAME                     login name for the proxy (default: \$USER)
+      --proxy                         attach the shared HTTPS nginx proxy (web)
+      --no-proxy                      do not use the nginx proxy (default)
+      --user NAME                     login name for proxy / app auth (default: \$USER)
       --geometry WxH                  virtual desktop size (x11 profiles, default $DEFAULT_GEOMETRY)
       --app-cmd CMD                   override the profile's application command
       --no-start                      generate and build only
@@ -64,6 +66,10 @@ Proxy
   proxy passwd NAME                   change the login for an instance
   proxy reload|status|logs            manage the proxy container
 
+Help
+  install                             print Debian/Ubuntu host install steps (does not install)
+  -h, --help                          this command list
+
 Environment
   DWORK_HOME          state directory (default ~/.config/dwork)
   DWORK_HTTPS_PORT    proxy port (default 4443)
@@ -72,13 +78,43 @@ Environment
 EOF
 }
 
+cmd_install() {
+  cat <<'EOF'
+These are the host packages dwork needs. This command does not install anything.
+
+dwork needs the Docker engine, the Compose v2 plugin (`docker compose`, not
+the old `docker-compose` binary), and a user that can talk to the daemon
+without sudo. Do not run dwork as root.
+
+Debian/Ubuntu (`docker.io` from apt):
+
+  sudo apt update
+  sudo apt install docker.io docker-compose-v2 docker-buildx
+  sudo usermod -aG docker "$USER"
+  # log out and back in (or: newgrp docker), then:
+  docker compose version
+  docker info
+
+`docker-buildx` is optional. Without it, `docker build` still works but prints
+a legacy-builder deprecation warning.
+
+If this host already uses Docker CE (`docker-ce`), do not also install
+`docker.io`. Use Docker's plugins instead:
+
+  sudo apt install docker-compose-plugin docker-buildx-plugin
+  sudo usermod -aG docker "$USER"
+
+Commands: dwork --help
+EOF
+}
+
 require_command() {
   command -v "$1" >/dev/null 2>&1 || die "$1 is required"
 }
 
 require_docker() {
-  require_command docker
-  docker compose version >/dev/null 2>&1 || die "docker compose plugin is required"
+  command -v docker >/dev/null 2>&1 || die "docker is required (see 'dwork install')"
+  docker compose version >/dev/null 2>&1 || die "docker compose plugin is required (see 'dwork install')"
 }
 
 valid_name() {
@@ -264,7 +300,7 @@ write_htpasswd() {
 # ---------------------------------------------------------------------------
 
 cmd_create() {
-  local name="" profile="" host_port="" proxy=1 user="${USER:-$(id -un)}"
+  local name="" profile="" host_port="" proxy=0 user="${USER:-$(id -un)}"
   local geometry="$DEFAULT_GEOMETRY" app_cmd="" start=1
   local vnc_host_port="5901" publish_vnc=1
   local mounts=()
@@ -276,6 +312,7 @@ cmd_create() {
       --port)       host_port="$2"; shift ;;
       --vnc-port)   vnc_host_port="$2"; publish_vnc=1; shift ;;
       --no-vnc)     publish_vnc=0; vnc_host_port="" ;;
+      --proxy)      proxy=1 ;;
       --no-proxy)   proxy=0 ;;
       --user)       user="$2"; shift ;;
       --geometry)   geometry="$2"; shift ;;
@@ -303,9 +340,13 @@ cmd_create() {
   ! instance_exists "$name" || die "instance $name already exists"
   ! docker container inspect "$name" >/dev/null 2>&1 || die "a container named $name already exists"
   case "$P_KIND" in
-    shell) proxy=0; host_port=""; publish_vnc=0; vnc_host_port="" ;;
-    x11)   proxy=0; host_port="" ;;
-    web)   publish_vnc=0; vnc_host_port="" ;;
+    shell) [ "$proxy" != 1 ] || die "--proxy is only valid for web profiles"
+           host_port=""; publish_vnc=0; vnc_host_port="" ;;
+    x11)   [ "$proxy" != 1 ] || die "--proxy is only valid for web profiles"
+           host_port="" ;;
+    web)   publish_vnc=0; vnc_host_port=""
+           [ "$proxy" = 1 ] || [ -n "$host_port" ] || \
+             warn "web instance has no published port and no proxy; pass --port HOSTPORT or --proxy" ;;
   esac
   [ "$publish_vnc" = 1 ] || vnc_host_port=""
   [ -n "$app_cmd" ] || app_cmd="$P_APP_CMD"
@@ -329,10 +370,14 @@ cmd_create() {
     volume_lines+="        target: $cont"$'\n'
   done
 
-  # Credentials (proxy login, optionally fed into the app as well)
+  # Credentials (proxy login, and/or fed into the app)
   local password=""
   if [ "$proxy" = 1 ] || [ -n "$P_AUTH_PASS_ENV" ]; then
-    echo "Login for https://$name.localhost:$HTTPS_PORT (user: $user)"
+    if [ "$proxy" = 1 ]; then
+      echo "Login for https://$name.localhost:$HTTPS_PORT (user: $user)"
+    else
+      echo "Login for $name (user: $user)"
+    fi
     prompt_password "$user"; password="$PASSWORD"; unset PASSWORD
   fi
 
@@ -529,6 +574,10 @@ cmd_url() {
   fi
   if [ -n "$DW_HOST_PORT" ]; then
     echo "Direct:  http://127.0.0.1:${DW_HOST_PORT}  (no TLS, no auth; tunnel it)"
+    echo "Tunnel:  ssh -N -L ${DW_HOST_PORT}:127.0.0.1:${DW_HOST_PORT} ${USER:-user}@$(hostname)"
+  fi
+  if [ "$DW_KIND" = web ] && [ "$DW_PROXY" != 1 ] && [ -z "$DW_HOST_PORT" ]; then
+    echo "$DW_NAME has no published HTTP port (create with --port N, or: dwork proxy add $DW_NAME)"
   fi
   if [ "$DW_KIND" = x11 ]; then
     if [ -n "$DW_VNC_HOST_PORT" ]; then
@@ -795,8 +844,9 @@ main() {
     profiles) cmd_profiles ;;
     build)    cmd_build "$@" ;;
     proxy)    cmd_proxy "$@" ;;
-    help|-h|--help) usage ;;
-    *) die "unknown command: $cmd (try 'dwork help')" ;;
+    install)  cmd_install ;;
+    -h|--help) usage ;;
+    *) die "unknown command: $cmd (try 'dwork --help')" ;;
   esac
 }
 
