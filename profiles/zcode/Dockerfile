@@ -3,7 +3,7 @@ FROM ${BASE_IMAGE}
 
 # ZCode, the Z.ai desktop app (Electron). Official Linux .deb from Z.ai's CDN.
 # Override with: dwork build zcode --build-arg ZCODE_VERSION=x.y.z
-ARG ZCODE_VERSION=3.11.2
+ARG ZCODE_VERSION=3.15.3
 ARG TARGETARCH
 # "Connect to Z.ai" signs in through the system browser, so ship one on the
 # virtual desktop. Build with --build-arg WITH_BROWSER=0 to leave it out and use

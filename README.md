@@ -16,6 +16,8 @@ app), or nothing at all (a plain **shell** box). Every instance:
   instances are a VNC desktop on `127.0.0.1:5901`. Both are intended to be
   reached remotely through SSH port forwarding.
 
+Author: Lars Ole Pontoppidan, Sept. 2026 (AI assisted work)
+
 ## Quick start
 
 ```sh
@@ -122,7 +124,8 @@ Included profiles:
 - `pi` – Pi terminal coding harness. Enter with `dwork bash NAME`, run `pi`,
   then use `/login` to authenticate a provider. Its configuration, provider
   credentials, packages and sessions persist in the instance home volume.
-- `opencode` – OpenCode web UI, installed into the image.
+- `opencode` – OpenCode 2 web UI, installed into the image. Pin a version with
+  `dwork build opencode --build-arg OPENCODE_VERSION=x.y.z`.
 - `zcode` – ZCode (Z.ai desktop app, Electron) from the official Linux `.deb`,
   started with `--no-sandbox --disable-gpu`. Ships Firefox so the "Connect to
   Z.ai" browser login can complete on the virtual desktop (`--build-arg
